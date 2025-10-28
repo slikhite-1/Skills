@@ -205,7 +205,7 @@ def get_executor(
             additional_kwargs["runtime"] = "runc"
         # wipp
         print(f"WIPP num_gpus_per_node {gpus_per_node}")
-        assert gpus_per_node is None
+        assert gpus_per_node is None  # WIPP
         d = DockerExecutor(
             container_image=resolved_container,
             packager=packager,
@@ -214,7 +214,7 @@ def get_executor(
             ntasks_per_node=1,
             privileged=bool(os.getenv("NEMO_SKILLS_PRIVILEGED_DOCKER", 0)),
             # locally we are always asking for all GPUs to be able to select a subset with CUDA_VISIBLE_DEVICES
-            num_gpus=-1 if gpus_per_node is not None else None,
+            num_gpus=-1 if gpus_per_node else None,
             network="host",
             env_vars=env_vars,
             additional_kwargs=additional_kwargs,
