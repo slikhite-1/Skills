@@ -13,7 +13,7 @@
 # limitations under the License.
 
 bs4
-click < 8.2.0  # https://github.com/ai-dynamo/dynamo/issues/1039
+# click < 8.2.0  # https://github.com/ai-dynamo/dynamo/issues/1039
 datasets>=4  # lcb problem with datasets 4.0.0
 evalplus @ git+https://github.com/evalplus/evalplus@c91370f
 fire
