@@ -258,12 +258,27 @@ class SweBenchGenerationTask(GenerationTask):
         # Fix localhost URLs not working sometimes
         command = f"echo '127.0.0.1 localhost' >/etc/hosts && {command}"
 
+        # Build environment variable flags for Apptainer
+        env_flags = ""
+        if os.getenv("HF_TOKEN"):
+            env_flags += f" --env HF_TOKEN={shlex.quote(os.getenv('HF_TOKEN'))}"
+            LOG.info("Passing HF_TOKEN to Apptainer container")
+        if os.getenv("HF_HOME"):
+            env_flags += f" --env HF_HOME={shlex.quote(os.getenv('HF_HOME'))}"
+            LOG.info(f"Passing HF_HOME={os.getenv('HF_HOME')} to Apptainer container")
+        if os.getenv("HF_DATASETS_OFFLINE"):
+            env_flags += f" --env HF_DATASETS_OFFLINE={shlex.quote(os.getenv('HF_DATASETS_OFFLINE'))}"
+            LOG.info("Passing HF_DATASETS_OFFLINE to Apptainer container")
+        if os.getenv("TRANSFORMERS_OFFLINE"):
+            env_flags += f" --env TRANSFORMERS_OFFLINE={shlex.quote(os.getenv('TRANSFORMERS_OFFLINE'))}"
+            LOG.info("Passing TRANSFORMERS_OFFLINE to Apptainer container")
+
         # Launch Apptainer container and execute the command
         apptainer_cmd = (
             f"apptainer exec --writable-tmpfs --no-mount home,tmp,bind-paths "
             f"--mount type=bind,src=/nemo_run/code,dst=/nemo_run/code "
             f"--mount type=bind,src={self.output_dir},dst=/trajectories_mount "
-            f" {container_name} bash -c {shlex.quote(command)}"
+            f"{env_flags} {container_name} bash -c {shlex.quote(command)}"
         )
 
         # Retry apptainer command up to max_retries times
