@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import shlex
+import subprocess
 import sys
 from dataclasses import field
 from enum import Enum
@@ -101,6 +102,10 @@ class SweBenchGenerationConfig:
     agent_config: str | None = None
     agent_max_turns: int = 100  # Max iterations for the agent
 
+    # Cache directory for cloned repositories. If None, uses workspace directory + '.swe-bench-cache'
+    # This allows sharing cached repos across workers on shared filesystems
+    cache_dir: str | None = None
+
     swebench_tests_timeout: int = 60 * 30  # Timeout for the tests after applying the patch, in seconds
 
     inference: SweBenchInferenceConfig = field(default_factory=SweBenchInferenceConfig)  # LLM call parameters
@@ -150,6 +155,21 @@ class SweBenchGenerationTask(GenerationTask):
 
         # needs to skip completed samples, not used otherwise
         self.cfg.prompt_format = "ns"
+        
+        # Cache directory for cloned repositories
+        # Use configured cache_dir, or default to workspace/.swe-bench-cache for shared access
+        if self.cfg.cache_dir:
+            self.cache_dir = Path(self.cfg.cache_dir)
+        else:
+            # Use workspace root (where the script is typically run from) for shared cache
+            workspace_root = Path(os.getcwd())
+            self.cache_dir = workspace_root / ".swe-bench-cache"
+        
+        self.cache_dir.mkdir(exist_ok=True, parents=True)
+        LOG.info(f"Using cache directory: {self.cache_dir}")
+        
+        # Setup cloned repositories
+        self._setup_cached_repos()
 
     def log_example_prompt(self, data):
         return
@@ -159,6 +179,74 @@ class SweBenchGenerationTask(GenerationTask):
 
     def setup_llm(self):
         return
+
+    def _setup_cached_repos(self):
+        """Clone agent framework and evaluation repositories once to cache directory.
+        
+        Note: Only clones repos on the host. Dependencies are installed inside the container
+        on first run, and the venv is persisted in the mounted directory.
+        """
+        # Setup SWE-agent repository
+        if self.cfg.agent_framework == SupportedAgentFrameworks.swe_agent:
+            agent_repo = self.cfg.agent_framework_repo or "https://github.com/SWE-agent/SWE-agent.git"
+            self.swe_agent_dir = self.cache_dir / "SWE-agent"
+            
+            if not self.swe_agent_dir.exists():
+                LOG.info(f"Cloning SWE-agent repository to {self.swe_agent_dir}")
+                subprocess.run(
+                    ["git", "clone", agent_repo, str(self.swe_agent_dir)],
+                    check=True,
+                    capture_output=True
+                )
+            
+            # Checkout the specified commit
+            LOG.info(f"Checking out SWE-agent commit: {self.cfg.agent_framework_commit}")
+            subprocess.run(
+                ["git", "-C", str(self.swe_agent_dir), "fetch", "origin"],
+                check=True,
+                capture_output=True
+            )
+            subprocess.run(
+                ["git", "-C", str(self.swe_agent_dir), "checkout", self.cfg.agent_framework_commit],
+                check=True,
+                capture_output=True
+            )
+        
+        # Setup OpenHands repository
+        elif self.cfg.agent_framework == SupportedAgentFrameworks.openhands:
+            agent_repo = self.cfg.agent_framework_repo or "https://github.com/All-Hands-AI/OpenHands.git"
+            self.openhands_dir = self.cache_dir / "OpenHands"
+            
+            if not self.openhands_dir.exists():
+                LOG.info(f"Cloning OpenHands repository to {self.openhands_dir}")
+                subprocess.run(
+                    ["git", "clone", agent_repo, str(self.openhands_dir)],
+                    check=True,
+                    capture_output=True
+                )
+            
+            # Checkout the specified commit
+            LOG.info(f"Checking out OpenHands commit: {self.cfg.agent_framework_commit}")
+            subprocess.run(
+                ["git", "-C", str(self.openhands_dir), "fetch", "origin"],
+                check=True,
+                capture_output=True
+            )
+            subprocess.run(
+                ["git", "-C", str(self.openhands_dir), "checkout", self.cfg.agent_framework_commit],
+                check=True,
+                capture_output=True
+            )
+        
+        # Setup SWE-bench evaluation repository (used by both frameworks)
+        self.swe_bench_dir = self.cache_dir / "SWE-bench"
+        if not self.swe_bench_dir.exists():
+            LOG.info(f"Cloning SWE-bench repository to {self.swe_bench_dir}")
+            subprocess.run(
+                ["git", "clone", "https://github.com/HeyyyyyyG/SWE-bench.git", str(self.swe_bench_dir)],
+                check=True,
+                capture_output=True
+            )
 
     def _find_container(self, data_point):
         """Find the container file using multiple strategies.
@@ -243,9 +331,13 @@ class SweBenchGenerationTask(GenerationTask):
         return container_name
 
     async def _execute_container_command(
-        self, data_point, command, expected_file_pattern, mode, max_retries=3, timeout=100000
+        self, data_point, command, expected_file_pattern, mode, max_retries=3, timeout=100000, extra_mounts=None
     ):
-        """Execute a command in an Apptainer container with retry logic."""
+        """Execute a command in an Apptainer container with retry logic.
+        
+        Args:
+            extra_mounts: List of tuples (src, dst) for additional bind mounts
+        """
         # Find the container using multiple strategies
         container_name = self._find_container(data_point)
 
@@ -273,11 +365,21 @@ class SweBenchGenerationTask(GenerationTask):
             env_flags += f" --env TRANSFORMERS_OFFLINE={shlex.quote(os.getenv('TRANSFORMERS_OFFLINE'))}"
             LOG.info("Passing TRANSFORMERS_OFFLINE to Apptainer container")
 
+        # Build additional mount flags
+        mount_flags = (
+            f"--mount type=bind,src=/nemo_run/code,dst=/nemo_run/code "
+            f"--mount type=bind,src={self.output_dir},dst=/trajectories_mount "
+        )
+        
+        if extra_mounts:
+            for src, dst in extra_mounts:
+                mount_flags += f"--mount type=bind,src={src},dst={dst} "
+                LOG.info(f"Mounting {src} to {dst}")
+
         # Launch Apptainer container and execute the command
         apptainer_cmd = (
             f"apptainer exec --writable-tmpfs --no-mount home,tmp,bind-paths "
-            f"--mount type=bind,src=/nemo_run/code,dst=/nemo_run/code "
-            f"--mount type=bind,src={self.output_dir},dst=/trajectories_mount "
+            f"{mount_flags}"
             f"{env_flags} {container_name} bash -c {shlex.quote(command)}"
         )
 
@@ -335,8 +437,8 @@ class SweBenchGenerationTask(GenerationTask):
 
     async def _run_swe_agent(self, data_point, api_base):
         """
-        Runs SWE-agent on one instance.
-        Returns the absolute (not mounted) path to a .jsonl file in the SWE-bench evaluation format.
+        Runs SWE-agent on one instance and evaluates the result in a single container execution.
+        Returns a dict with the results.
         """
         if self.cfg.agent_config is None:
             self.cfg.agent_config = "eval/swe-bench/swe-agent/default"
@@ -352,20 +454,18 @@ class SweBenchGenerationTask(GenerationTask):
             completion_kwargs["logprobs"] = True
 
         swe_agent_cmd = (
-            # first installing swe-agent repo
+            # Install uv if not already available
             "curl -LsSf https://astral.sh/uv/install.sh | sh && "
             "source /root/.local/bin/env && "
-            "cd /root && "
-            "mkdir SWE-agent && "
-            "cd SWE-agent && "
-            f"git clone {self.cfg.agent_framework_repo} . && "
-            f"git checkout {self.cfg.agent_framework_commit} && "
-            "uv venv --python 3.12 venv && "
-            # do not activate venv, use uv pip with -p flag instead
-            # "source venv/bin/activate && "
-            # "uv pip install -e . && "
-            "uv pip install -p /root/SWE-agent/venv/bin/python -e . && "
-            # then running the agent
+            # SWE-agent is already cloned and mounted
+            "cd /root/SWE-agent && "
+            # Install dependencies only if venv doesn't exist (first run only)
+            "if [ ! -d venv ]; then "
+            "    echo 'Installing SWE-agent dependencies (first run only)...' && "
+            "    uv venv --python 3.12 venv && "
+            "    uv pip install -p /root/SWE-agent/venv/bin/python -e . ; "
+            "fi && "
+            # Run the agent
             f"/root/SWE-agent/venv/bin/python -m sweagent run "
             f"    --config {get_config_path(self.cfg.agent_config)} "
             f"    --agent.model.name hosted_vllm/{self.cfg.server.model} "
@@ -380,27 +480,102 @@ class SweBenchGenerationTask(GenerationTask):
             f"    --env.repo.base_commit {data_point['base_commit']} "
             f"    --problem_statement.text {shlex.quote(data_point['problem_statement'])} "
             f"    --problem_statement.id {data_point['instance_id']} && "
-            # move trajectories to the mounted directory
-            f"cp -r trajectories /trajectories_mount/"
+            # Convert .pred to .jsonl for evaluation
+            f"cd /root/SWE-agent && "
+            f"find trajectories -name '{data_point['instance_id']}.pred' -exec sh -c 'cp \"$1\" \"${{1%.pred}}.jsonl\"' _ {{}} \\; && "
+            # Copy trajectories first (needed even if no patch)
+            f"cp -r trajectories /trajectories_mount/ && "
+            # Check if patch exists before running evaluation
+            f"PRED_FILE=$(find /root/SWE-agent/trajectories -name '{data_point['instance_id']}.jsonl' | head -1) && "
+            f"if [ -f \"$PRED_FILE\" ] && grep -q '\"model_patch\":\\s*\"' \"$PRED_FILE\" 2>/dev/null; then "
+            # Patch exists, run evaluation
+            "    cd /root/SWE-bench && "
+            # Install SWE-bench dependencies only if venv doesn't exist (first run only)
+            "    if [ ! -d venv ]; then "
+            "        echo 'Installing SWE-bench dependencies (first run only)...' && "
+            "        uv venv --python 3.12 venv && "
+            "        uv pip install -p /root/SWE-bench/venv/bin/python -e . ; "
+            "    fi && "
+            # Run evaluation with clean environment
+            f"    env -u VIRTUAL_ENV /root/SWE-bench/venv/bin/python -m swebench.harness.run_local_evaluation "
+            f"        --predictions_path \"$PRED_FILE\" "
+            f"        --instance_ids {data_point['instance_id']} "
+            f"        --run_id eval-outputs "
+            f"        --timeout {self.cfg.swebench_tests_timeout} "
+            f"        --dataset_name {data_point['dataset_name']} "
+            f"        --split {data_point['split']} && "
+            "    cp -r logs/run_evaluation/eval-outputs /trajectories_mount/ ; "
+            "else "
+            # No patch, create a dummy report file
+            "    echo 'No patch found, skipping evaluation' && "
+            f"    mkdir -p /trajectories_mount/eval-outputs/{data_point['instance_id']} && "
+            f"    echo '{{' > /trajectories_mount/eval-outputs/{data_point['instance_id']}/report.json && "
+            f"    echo '  \"{data_point['instance_id']}\": {{' >> /trajectories_mount/eval-outputs/{data_point['instance_id']}/report.json && "
+            f"    echo '    \"resolved\": false,' >> /trajectories_mount/eval-outputs/{data_point['instance_id']}/report.json && "
+            f"    echo '    \"patch_exists\": false,' >> /trajectories_mount/eval-outputs/{data_point['instance_id']}/report.json && "
+            f"    echo '    \"patch_successfully_applied\": false' >> /trajectories_mount/eval-outputs/{data_point['instance_id']}/report.json && "
+            f"    echo '  }}' >> /trajectories_mount/eval-outputs/{data_point['instance_id']}/report.json && "
+            f"    echo '}}' >> /trajectories_mount/eval-outputs/{data_point['instance_id']}/report.json ; "
+            "fi"
         )
 
-        # Execute SWE-agent command
-        search_path = os.path.join(self.output_dir / "trajectories", "**", f"{data_point['instance_id']}.pred")
-        pred_file = await self._execute_container_command(data_point, swe_agent_cmd, search_path, mode="agent")
+        # Mount both cached directories
+        extra_mounts = [
+            (str(self.swe_agent_dir), "/root/SWE-agent"),
+            (str(self.swe_bench_dir), "/root/SWE-bench")
+        ]
 
-        with open(pred_file, "r") as f:
-            trajectory_dict = json.loads(f.read().strip())
+        # Execute combined command - look for the evaluation report as the expected file
+        search_path = os.path.join(
+            self.output_dir, "eval-outputs", "**", f"{data_point['instance_id']}/report.json"
+        )
+        
+        try:
+            report_file = await self._execute_container_command(
+                data_point,
+                swe_agent_cmd,
+                search_path,
+                mode="agent_and_eval",
+                extra_mounts=extra_mounts,
+                timeout=self.cfg.swebench_tests_timeout + 300,  # Extra time for agent + eval
+            )
+            
+            # Read the report
+            with open(report_file, "r") as f:
+                report_json = json.loads(f.read().strip())
+                
+        except ValueError as e:
+            LOG.error("Failed to execute SWE-agent or evaluation for %s: %s", data_point["instance_id"], e)
+            report_json = {
+                data_point["instance_id"]: {
+                    "resolved": False,
+                    "patch_exists": False,
+                    "patch_successfully_applied": False,
+                }
+            }
 
-        # need to rename .pred to .jsonl
-        pred_jsonl_file = pred_file.replace(".pred", ".jsonl")
-        with open(pred_jsonl_file, "w") as f:
-            f.write(json.dumps(trajectory_dict))
+        # Read the trajectory file
+        pred_files = glob.glob(
+            os.path.join(self.output_dir / "trajectories", "**", f"{data_point['instance_id']}.jsonl"),
+            recursive=True
+        )
+        
+        if pred_files:
+            with open(pred_files[0], "r") as f:
+                trajectory_dict = json.loads(f.read().strip())
+        else:
+            LOG.warning("No trajectory file found for %s", data_point["instance_id"])
+            trajectory_dict = {
+                "model_name_or_path": self.cfg.server.get("model", "unknown"),
+                "instance_id": data_point["instance_id"],
+                "model_patch": None,
+            }
 
-        # TODO: get num_generated_tokens and other stats from .traj file
-        # looks like data['info']['model_stats']
-        # {'instance_cost': 0, 'tokens_sent': 40858, 'tokens_received': 1775, 'api_calls': 9}
-
-        return pred_jsonl_file
+        return {
+            "swe-bench-metrics": report_json[data_point["instance_id"]],
+            "swe-bench-outputs": trajectory_dict,
+            "generation": "",  # required TODO: we should fix this
+        }
 
     async def _run_openhands(self, data_point, api_base):
         """
@@ -446,7 +621,7 @@ class SweBenchGenerationTask(GenerationTask):
             "    echo 'This is because OpenHands DELETES EVERYTHING in the /workspace folder if it exists.' && "
             "    exit 1; "
             "fi && "
-            # install openhands repo + dependencies
+            # OpenHands is already cloned and mounted, install dependencies
             "cd /root && "
             'curl -L -O "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-$(uname)-$(uname -m).sh" && '
             "bash Miniforge3-$(uname)-$(uname -m).sh -b && "
@@ -469,10 +644,7 @@ class SweBenchGenerationTask(GenerationTask):
             "chmod 700 /tmp/tmux-$uid && "
             # Start tmux server on the exact socket path (idempotent)
             "tmux -S /tmp/tmux-$uid/default start-server || true && "
-            "mkdir OpenHands && "
-            "cd OpenHands && "
-            f"git clone {self.cfg.agent_framework_repo} . && "
-            f"git checkout {self.cfg.agent_framework_commit} && "
+            "cd /root/OpenHands && "
             "export INSTALL_DOCKER=0 && "
             "make build && "
             "poetry run python -m pip install datasets && "
@@ -498,9 +670,14 @@ class SweBenchGenerationTask(GenerationTask):
             f"cp -r evaluation/evaluation_outputs/outputs/*/*/* /trajectories_mount/trajectories/{data_point['instance_id']}"
         )
 
+        # Mount the cached OpenHands directory
+        extra_mounts = [(str(self.openhands_dir), "/root/OpenHands")]
+
         # Execute OpenHands command
         search_path = os.path.join(self.output_dir / "trajectories", "**", data_point["instance_id"], "output.jsonl")
-        out_file = await self._execute_container_command(data_point, openhands_cmd, search_path, mode="agent")
+        out_file = await self._execute_container_command(
+            data_point, openhands_cmd, search_path, mode="agent", extra_mounts=extra_mounts
+        )
 
         with open(out_file, "r") as f:
             out_dict = json.loads(f.read().strip())
@@ -536,86 +713,94 @@ class SweBenchGenerationTask(GenerationTask):
             api_base = f"http://{self.cfg.server.host}:{self.cfg.server.port}/v1"
 
         if self.cfg.agent_framework == SupportedAgentFrameworks.swe_agent:
-            pred_file = await self._run_swe_agent(data_point, api_base)
+            # SWE-agent now returns the complete result dict (agent + eval combined)
+            output_dict = await self._run_swe_agent(data_point, api_base)
         elif self.cfg.agent_framework == SupportedAgentFrameworks.openhands:
+            # OpenHands still uses separate evaluation
             pred_file = await self._run_openhands(data_point, api_base)
+            
+            pred_mounted_path = pred_file.replace(str(self.output_dir), "/trajectories_mount")
+            with open(pred_file, "r") as f:
+                trajectory_dict = json.loads(f.read())
+
+            # Check if the trajectory has an empty patch before running evaluation
+            has_patch = trajectory_dict["model_patch"] is not None
+
+            if not has_patch:
+                report_json = {
+                    data_point["instance_id"]: {
+                        "resolved": False,
+                        "patch_exists": False,
+                        "patch_successfully_applied": False,
+                    }
+                }
+            else:
+                # Run full evaluation with streaming output
+                swe_bench_cmd = (
+                    # Install uv if not already available
+                    "curl -LsSf https://astral.sh/uv/install.sh | sh && "
+                    "source /root/.local/bin/env && "
+                    # SWE-bench is already cloned and mounted
+                    "cd /root/SWE-bench && "
+                    # Install dependencies only if venv doesn't exist (first run only)
+                    "if [ ! -d venv ]; then "
+                    "    echo 'Installing SWE-bench dependencies (first run only)...' && "
+                    "    uv venv --python 3.12 venv && "
+                    "    uv pip install -p /root/SWE-bench/venv/bin/python -e . ; "
+                    "fi && "
+                    # Run with clean environment to avoid venv contamination
+                    f"env -u VIRTUAL_ENV /root/SWE-bench/venv/bin/python -m swebench.harness.run_local_evaluation "
+                    f"    --predictions_path {pred_mounted_path} "
+                    f"    --instance_ids {data_point['instance_id']} "
+                    f"    --run_id eval-outputs "
+                    f"    --timeout {self.cfg.swebench_tests_timeout} "
+                    f"    --dataset_name {data_point['dataset_name']} "
+                    f"    --split {data_point['split']} && "
+                    f"cp -r logs/run_evaluation/eval-outputs /trajectories_mount/"
+                )
+
+                # Mount the cached SWE-bench directory
+                extra_mounts = [(str(self.swe_bench_dir), "/root/SWE-bench")]
+
+                # Execute SWE-bench evaluation command
+                search_path = os.path.join(
+                    self.output_dir, "eval-outputs", "**", f"{data_point['instance_id']}/report.json"
+                )
+                # TODO: should we fail on errors here? Seems that json isn't always generated
+                try:
+                    report_file = await self._execute_container_command(
+                        data_point,
+                        swe_bench_cmd,
+                        search_path,
+                        mode="eval",
+                        timeout=self.cfg.swebench_tests_timeout + 120,
+                        extra_mounts=extra_mounts,
+                    )
+                except ValueError:
+                    LOG.error("Failed to execute SWE-bench evaluation command for %s", data_point["instance_id"])
+                    report_json = {
+                        data_point["instance_id"]: {
+                            "resolved": False,
+                            "patch_exists": True,
+                            "patch_successfully_applied": False,
+                        }
+                    }
+                    report_file = None
+
+                if report_file is not None:
+                    with open(report_file, "r") as f:
+                        report_json = json.loads(f.read().strip())
+
+            output_dict = {
+                "swe-bench-metrics": report_json[data_point["instance_id"]],
+                "swe-bench-outputs": trajectory_dict,
+                "generation": "",  # required TODO: we should fix this
+            }
         else:
             raise ValueError(
                 f"Unsupported agent framework: {self.cfg.agent_framework}. "
                 f"Supported frameworks: {', '.join(SupportedAgentFrameworks)}."
             )
-
-        pred_mounted_path = pred_file.replace(str(self.output_dir), "/trajectories_mount")
-        with open(pred_file, "r") as f:
-            trajectory_dict = json.loads(f.read())
-
-        # Check if the trajectory has an empty patch before running evaluation
-        has_patch = trajectory_dict["model_patch"] is not None
-
-        if not has_patch:
-            report_json = {
-                data_point["instance_id"]: {
-                    "resolved": False,
-                    "patch_exists": False,
-                    "patch_successfully_applied": False,
-                }
-            }
-        else:
-            # Run full evaluation with streaming output
-            swe_bench_cmd = (
-                # first installing SWE-bench repo
-                "curl -LsSf https://astral.sh/uv/install.sh | sh && "
-                "source /root/.local/bin/env && "
-                "cd /root && "
-                "git clone https://github.com/HeyyyyyyG/SWE-bench.git && "
-                "cd SWE-bench && "
-                "uv venv --python 3.12 venv && "
-                # DO NOT activate venv, use uv pip with -p flag instead
-                "uv pip install -p /root/SWE-bench/venv/bin/python -e . && "
-                # Run with clean environment to avoid venv contamination
-                f"env -u VIRTUAL_ENV /root/SWE-bench/venv/bin/python -m swebench.harness.run_local_evaluation "
-                f"    --predictions_path {pred_mounted_path} "
-                f"    --instance_ids {data_point['instance_id']} "
-                f"    --run_id eval-outputs "
-                f"    --timeout {self.cfg.swebench_tests_timeout} "
-                f"    --dataset_name {data_point['dataset_name']} "
-                f"    --split {data_point['split']} && "
-                f"cp -r logs/run_evaluation/eval-outputs /trajectories_mount/"
-            )
-
-            # Execute SWE-bench evaluation command
-            search_path = os.path.join(
-                self.output_dir, "eval-outputs", "**", f"{data_point['instance_id']}/report.json"
-            )
-            # TODO: should we fail on errors here? Seems that json isn't always generated
-            try:
-                report_file = await self._execute_container_command(
-                    data_point,
-                    swe_bench_cmd,
-                    search_path,
-                    mode="eval",
-                    timeout=self.cfg.swebench_tests_timeout + 120,
-                )
-            except ValueError:
-                LOG.error("Failed to execute SWE-bench evaluation command for %s", data_point["instance_id"])
-                report_json = {
-                    data_point["instance_id"]: {
-                        "resolved": False,
-                        "patch_exists": True,
-                        "patch_successfully_applied": False,
-                    }
-                }
-                report_file = None
-
-            if report_file is not None:
-                with open(report_file, "r") as f:
-                    report_json = json.loads(f.read().strip())
-
-        output_dict = {
-            "swe-bench-metrics": report_json[data_point["instance_id"]],
-            "swe-bench-outputs": trajectory_dict,
-            "generation": "",  # required TODO: we should fix this
-        }
 
         return output_dict
 
